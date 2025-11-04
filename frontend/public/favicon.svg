@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <!-- Background circle -->
+  <circle cx="50" cy="50" r="48" fill="#3b82f6" stroke="#2563eb" stroke-width="2"/>
+  
+  <!-- Sharing arrows/transfer icon -->
+  <!-- Left arrow pointing right -->
+  <path d="M 25 35 L 35 42.5 L 35 37.5 L 45 37.5 L 45 47.5 L 35 47.5 L 35 42.5 Z" fill="white" opacity="0.9"/>
+  <path d="M 35 37.5 L 45 42.5 L 35 47.5 Z" fill="white"/>
+  
+  <!-- Right arrow pointing left -->
+  <path d="M 75 62.5 L 65 55 L 65 60 L 55 60 L 55 50 L 65 50 L 65 55 Z" fill="white" opacity="0.9"/>
+  <path d="M 65 60 L 55 55 L 65 50 Z" fill="white"/>
+  
+  <!-- Center connection lines -->
+  <line x1="45" y1="42.5" x2="55" y2="55" stroke="white" stroke-width="3" stroke-linecap="round"/>
+  <line x1="55" y1="42.5" x2="45" y2="55" stroke="white" stroke-width="3" stroke-linecap="round"/>
+  
+  <!-- Small dots representing files/data -->
+  <circle cx="30" cy="40" r="2" fill="white" opacity="0.8"/>
+  <circle cx="70" cy="58" r="2" fill="white" opacity="0.8"/>
+</svg>
+
