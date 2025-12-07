@@ -13,6 +13,8 @@ const BrowserTransfer = () => {
   });
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [connectionState, setConnectionState] = useState('disconnected'); // disconnected, connecting, connected, reconnecting, unstable
   const [peerId, setPeerId] = useState(null);
   const [peers, setPeers] = useState([]);
   const [signalingAvailable, setSignalingAvailable] = useState(null);
@@ -23,6 +25,9 @@ const BrowserTransfer = () => {
   const [transferProgress, setTransferProgress] = useState(null);
   const [pendingFileRequest, setPendingFileRequest] = useState(null);
   const [transferHistory, setTransferHistory] = useState([]);
+
+  // Reconnection state
+  const [reconnectInfo, setReconnectInfo] = useState(null);
 
   const fileInputRef = useRef(null);
 
@@ -50,6 +55,9 @@ const BrowserTransfer = () => {
       console.log('Connected to room:', data);
       setIsConnected(true);
       setIsConnecting(false);
+      setIsReconnecting(false);
+      setConnectionState('connected');
+      setReconnectInfo(null);
       setPeerId(data.peerId);
       setRoomId(data.roomId);
       setPeers(data.peers || []);
@@ -58,10 +66,40 @@ const BrowserTransfer = () => {
 
     webrtcService.onDisconnected = () => {
       setIsConnected(false);
+      setIsReconnecting(false);
+      setConnectionState('disconnected');
+      setReconnectInfo(null);
       setPeerId(null);
       setPeers([]);
       setSelectedPeer(null);
       toast('Disconnected from room');
+    };
+
+    webrtcService.onReconnecting = (info) => {
+      console.log('Reconnecting:', info);
+      setIsReconnecting(true);
+      setConnectionState('reconnecting');
+      setReconnectInfo(info);
+      toast(`Reconnecting... (attempt ${info.attempt}/${info.maxAttempts})`);
+    };
+
+    webrtcService.onReconnected = () => {
+      console.log('Reconnected successfully');
+      setIsReconnecting(false);
+      setConnectionState('connected');
+      setReconnectInfo(null);
+      toast.success('Reconnected successfully!');
+    };
+
+    webrtcService.onConnectionStateChange = (state) => {
+      console.log('Connection state changed:', state);
+      setConnectionState(state);
+
+      if (state === 'unstable') {
+        toast('Connection unstable, attempting to recover...', { icon: '⚠️' });
+      } else if (state === 'offline') {
+        toast('You are offline. Will reconnect when back online.', { icon: '📡' });
+      }
     };
 
     webrtcService.onPeerJoined = (data) => {
@@ -80,6 +118,15 @@ const BrowserTransfer = () => {
         setSelectedPeer(null);
       }
       toast(`A peer left the room`);
+    };
+
+    webrtcService.onPeerConnectionReady = (data) => {
+      console.log('Peer connection ready:', data);
+      // Force re-render to update the connection status indicator
+      setPeers(prevPeers => [...prevPeers]);
+      if (data.ready) {
+        toast.success('Peer connection established!');
+      }
     };
 
     webrtcService.onError = (error) => {
@@ -141,8 +188,12 @@ const BrowserTransfer = () => {
       // Clean up
       webrtcService.onConnected = null;
       webrtcService.onDisconnected = null;
+      webrtcService.onReconnecting = null;
+      webrtcService.onReconnected = null;
+      webrtcService.onConnectionStateChange = null;
       webrtcService.onPeerJoined = null;
       webrtcService.onPeerLeft = null;
+      webrtcService.onPeerConnectionReady = null;
       webrtcService.onError = null;
       webrtcService.onFileRequest = null;
       webrtcService.onFileAccepted = null;
@@ -174,6 +225,30 @@ const BrowserTransfer = () => {
   useEffect(() => {
     localStorage.setItem('crossdrop_device_name', deviceName);
   }, [deviceName]);
+
+  // Poll for connection status updates while peers are connecting
+  useEffect(() => {
+    if (!isConnected || peers.length === 0) return;
+
+    // Check if any peers are still connecting
+    const hasConnectingPeers = peers.some(peer => !webrtcService.isConnectedTo(peer.peerId));
+
+    if (!hasConnectingPeers) return;
+
+    // Poll every 500ms to update UI while connections are establishing
+    const pollInterval = setInterval(() => {
+      // Force re-render to update connection statuses
+      setPeers(prevPeers => [...prevPeers]);
+
+      // Check if all peers are now connected
+      const stillConnecting = peers.some(peer => !webrtcService.isConnectedTo(peer.peerId));
+      if (!stillConnecting) {
+        clearInterval(pollInterval);
+      }
+    }, 500);
+
+    return () => clearInterval(pollInterval);
+  }, [isConnected, peers]);
 
   // Create a new room
   const handleCreateRoom = async () => {
@@ -456,7 +531,34 @@ const BrowserTransfer = () => {
               <div className="card mb-6">
                 <div className="flex items-center justify-between flex-wrap gap-4">
                   <div>
-                    <p className="text-sm text-[var(--color-text-tertiary)] mb-1">Room ID</p>
+                    <div className="flex items-center gap-2 mb-1">
+                      <p className="text-sm text-[var(--color-text-tertiary)]">Room ID</p>
+                      {/* Connection Status Indicator */}
+                      <div className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium ${
+                        connectionState === 'connected'
+                          ? 'bg-[var(--color-success)]/10 text-[var(--color-success)]'
+                          : connectionState === 'reconnecting'
+                          ? 'bg-[var(--color-warning)]/10 text-[var(--color-warning)]'
+                          : connectionState === 'unstable'
+                          ? 'bg-[var(--color-warning)]/10 text-[var(--color-warning)]'
+                          : 'bg-[var(--color-error)]/10 text-[var(--color-error)]'
+                      }`}>
+                        <div className={`w-2 h-2 rounded-full ${
+                          connectionState === 'connected'
+                            ? 'bg-[var(--color-success)] animate-pulse'
+                            : connectionState === 'reconnecting'
+                            ? 'bg-[var(--color-warning)] animate-pulse'
+                            : connectionState === 'unstable'
+                            ? 'bg-[var(--color-warning)]'
+                            : 'bg-[var(--color-error)]'
+                        }`} />
+                        {connectionState === 'connected' && 'Connected'}
+                        {connectionState === 'reconnecting' && `Reconnecting${reconnectInfo ? ` (${reconnectInfo.attempt}/${reconnectInfo.maxAttempts})` : '...'}`}
+                        {connectionState === 'unstable' && 'Unstable'}
+                        {connectionState === 'offline' && 'Offline'}
+                        {connectionState === 'disconnected' && 'Disconnected'}
+                      </div>
+                    </div>
                     <div className="flex items-center gap-3">
                       <span className="text-3xl font-bold font-mono text-[var(--color-primary)] tracking-widest">
                         {roomId}
@@ -519,6 +621,23 @@ const BrowserTransfer = () => {
                       {peers.map((peer) => {
                         const isSelected = selectedPeer?.peerId === peer.peerId;
                         const isConnectedToPeer = webrtcService.isConnectedTo(peer.peerId);
+                        const connectionStatus = webrtcService.getPeerConnectionStatus(peer.peerId);
+
+                        // Determine status text and color
+                        let statusText = 'Establishing connection...';
+                        let statusColor = 'bg-[var(--color-warning)]';
+
+                        if (isConnectedToPeer) {
+                          statusText = 'Ready to transfer';
+                          statusColor = 'bg-[var(--color-success)]';
+                        } else if (connectionStatus.iceConnectionState === 'checking') {
+                          statusText = 'Connecting...';
+                        } else if (connectionStatus.iceConnectionState === 'failed') {
+                          statusText = 'Connection failed';
+                          statusColor = 'bg-[var(--color-error)]';
+                        } else if (connectionStatus.iceConnectionState === 'disconnected') {
+                          statusText = 'Reconnecting...';
+                        }
 
                         return (
                           <div
@@ -538,8 +657,8 @@ const BrowserTransfer = () => {
                                       <path strokeLinecap="round" strokeLinejoin="round" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
                                     </svg>
                                   </div>
-                                  <div className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-[var(--color-surface)] ${
-                                    isConnectedToPeer ? 'bg-[var(--color-success)]' : 'bg-[var(--color-warning)]'
+                                  <div className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-[var(--color-surface)] ${statusColor} ${
+                                    !isConnectedToPeer && connectionStatus.iceConnectionState !== 'failed' ? 'animate-pulse' : ''
                                   }`} />
                                 </div>
                                 <div>
@@ -547,7 +666,7 @@ const BrowserTransfer = () => {
                                     {peer.deviceName}
                                   </h3>
                                   <p className="text-xs text-[var(--color-text-tertiary)]">
-                                    {isConnectedToPeer ? 'Ready to transfer' : 'Establishing connection...'}
+                                    {statusText}
                                   </p>
                                 </div>
                               </div>
