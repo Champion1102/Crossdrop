@@ -104,60 +104,75 @@ async def request_connection(request: ConnectionRequest):
     )
     logger.info(f"  ✓ Created local request: {request_id}")
     
-    # Send connection request to target device via HTTP
+    # Send connection request to target device via HTTP with retry
     import requests
+    import time as time_module
+
     target_url = f"http://{peer_ip}:8000/connections/incoming-request"
-    
+    request_delivered = False
+    max_retries = 3
+
     # Visible console output (like broadcast messages)
     print(f"📤 Sending connection request to {peer_name} ({peer_ip})")
     print(f"   Request ID: {request_id}")
     print(f"   Target URL: {target_url}")
     logger.info(f"  📡 Attempting to send request to: {target_url}")
-    
-    try:
-        response = requests.post(
-            target_url,
-            json={
-                "request_id": request_id,
-                "from_ip": local_ip,
-                "from_name": local_name,
-                "to_ip": peer_ip,
-                "to_name": peer_name,
-                "created_at": datetime.now().isoformat()
-            },
-            timeout=5
-        )
-        logger.info(f"  ✓ HTTP POST successful: Status {response.status_code}")
-        logger.debug(f"  Response: {response.text}")
-        
-        if response.status_code == 200:
-            print(f"✅ Connection request successfully delivered to {peer_ip}")
-            logger.info(f"  ✅ Connection request successfully delivered to {peer_ip}")
-        else:
-            print(f"⚠ Unexpected status code from {peer_ip}: {response.status_code}")
-            logger.warning(f"  ⚠ Unexpected status code: {response.status_code}")
-            
-    except requests.exceptions.ConnectionError as e:
-        error_msg = f"✗ Connection failed to {peer_ip}:8000 - {str(e)}"
-        print(error_msg)
-        logger.error(f"  {error_msg}")
-        logger.error(f"  Error details: {traceback.format_exc()}")
-        print(f"   ℹ Request stored locally. Target device will poll for requests.")
-        logger.info(f"  ℹ Request stored locally. Target device will poll for requests.")
-    except requests.exceptions.Timeout as e:
-        error_msg = f"✗ Timeout connecting to {peer_ip}:8000 - {str(e)}"
-        print(error_msg)
-        logger.error(f"  {error_msg}")
-    except requests.exceptions.RequestException as e:
-        error_msg = f"✗ Request error to {peer_ip}: {str(e)}"
-        print(error_msg)
-        logger.error(f"  {error_msg}")
-        logger.error(f"  Error details: {traceback.format_exc()}")
-    except Exception as e:
-        error_msg = f"✗ Unexpected error sending request: {str(e)}"
-        print(error_msg)
-        logger.error(f"  {error_msg}")
-        logger.error(f"  Error details: {traceback.format_exc()}")
+
+    for attempt in range(max_retries):
+        try:
+            print(f"   Attempt {attempt + 1}/{max_retries}...")
+            response = requests.post(
+                target_url,
+                json={
+                    "request_id": request_id,
+                    "from_ip": local_ip,
+                    "from_name": local_name,
+                    "to_ip": peer_ip,
+                    "to_name": peer_name,
+                    "created_at": datetime.now().isoformat()
+                },
+                timeout=5
+            )
+            logger.info(f"  ✓ HTTP POST successful: Status {response.status_code}")
+            logger.debug(f"  Response: {response.text}")
+
+            if response.status_code == 200:
+                print(f"✅ Connection request successfully delivered to {peer_ip}")
+                logger.info(f"  ✅ Connection request successfully delivered to {peer_ip}")
+                request_delivered = True
+                break
+            else:
+                print(f"⚠ Unexpected status code from {peer_ip}: {response.status_code}")
+                logger.warning(f"  ⚠ Unexpected status code: {response.status_code}")
+
+        except requests.exceptions.ConnectionError as e:
+            error_msg = f"✗ Connection failed to {peer_ip}:8000 (attempt {attempt + 1})"
+            print(error_msg)
+            logger.error(f"  {error_msg}: {str(e)}")
+            if attempt < max_retries - 1:
+                time_module.sleep(0.5)  # Wait before retry
+        except requests.exceptions.Timeout as e:
+            error_msg = f"✗ Timeout connecting to {peer_ip}:8000 (attempt {attempt + 1})"
+            print(error_msg)
+            logger.error(f"  {error_msg}")
+            if attempt < max_retries - 1:
+                time_module.sleep(0.5)
+        except requests.exceptions.RequestException as e:
+            error_msg = f"✗ Request error to {peer_ip}: {str(e)}"
+            print(error_msg)
+            logger.error(f"  {error_msg}")
+            break  # Don't retry on other request errors
+        except Exception as e:
+            error_msg = f"✗ Unexpected error sending request: {str(e)}"
+            print(error_msg)
+            logger.error(f"  {error_msg}")
+            logger.error(f"  Error details: {traceback.format_exc()}")
+            break
+
+    if not request_delivered:
+        print(f"⚠ Could not deliver request to {peer_ip} after {max_retries} attempts")
+        print(f"   ℹ Request stored locally. Target device may not receive it.")
+        logger.warning(f"  ℹ Request not delivered - target device may not receive it")
     
     logger.info(f"  📋 Request ID: {request_id}")
     return {
@@ -165,7 +180,8 @@ async def request_connection(request: ConnectionRequest):
         "message": f"Connection requested to {peer_name}",
         "request_id": request_id,
         "peer_ip": peer_ip,
-        "peer_name": peer_name
+        "peer_name": peer_name,
+        "request_delivered": request_delivered
     }
 
 
@@ -263,34 +279,52 @@ async def accept_connection(request: AcceptRequest):
     if success:
         print(f"✅ Connection accepted from {conn_request['from_name']} ({conn_request['from_ip']})")
         logger.info(f"✅ Connection accepted from {conn_request['from_name']}")
-        
-        # Notify the requesting device that connection was accepted
+
+        # Notify the requesting device that connection was accepted with retry
         import requests
-        try:
-            notify_url = f"http://{conn_request['from_ip']}:8000/connections/connection-accepted"
-            print(f"📡 Notifying {conn_request['from_ip']} of connection acceptance...")
-            response = requests.post(
-                notify_url,
-                json={
-                    "peer_ip": local_ip,
-                    "peer_name": discovery_service.device_name if discovery_service else "Unknown"
-                },
-                timeout=5
-            )
-            if response.status_code == 200:
-                print(f"✅ Acceptance notification delivered to {conn_request['from_ip']}")
-            else:
-                print(f"⚠ Failed to notify {conn_request['from_ip']}: Status {response.status_code}")
-        except Exception as e:
-            error_msg = f"✗ Could not notify peer of acceptance: {e}"
-            print(error_msg)
-            logger.error(error_msg)
-        
+        import time
+
+        notify_url = f"http://{conn_request['from_ip']}:8000/connections/connection-accepted"
+        notification_delivered = False
+        max_retries = 3
+
+        for attempt in range(max_retries):
+            try:
+                print(f"📡 Notifying {conn_request['from_ip']} of connection acceptance... (attempt {attempt + 1}/{max_retries})")
+                response = requests.post(
+                    notify_url,
+                    json={
+                        "peer_ip": local_ip,
+                        "peer_name": discovery_service.device_name if discovery_service else "Unknown"
+                    },
+                    timeout=5
+                )
+                if response.status_code == 200:
+                    print(f"✅ Acceptance notification delivered to {conn_request['from_ip']}")
+                    notification_delivered = True
+                    break
+                else:
+                    print(f"⚠ Unexpected status from {conn_request['from_ip']}: {response.status_code}")
+            except requests.exceptions.ConnectionError as e:
+                print(f"⚠ Connection error (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)  # Wait 500ms before retry
+            except Exception as e:
+                error_msg = f"✗ Could not notify peer of acceptance: {e}"
+                print(error_msg)
+                logger.error(error_msg)
+                break
+
+        if not notification_delivered:
+            print(f"⚠ Could not deliver notification to {conn_request['from_ip']} after {max_retries} attempts")
+            print(f"   The peer will discover the connection on next poll")
+
         return {
             "status": "accepted",
             "message": f"Connection accepted with {conn_request['from_name']}",
             "peer_ip": conn_request["from_ip"],
-            "peer_name": conn_request["from_name"]
+            "peer_name": conn_request["from_name"],
+            "notification_delivered": notification_delivered
         }
     else:
         raise HTTPException(status_code=500, detail="Failed to accept connection")
@@ -306,11 +340,14 @@ async def receive_connection_accepted(notification: ConnectionAcceptedNotificati
     """Receive notification that a connection was accepted on the other device"""
     if connection_manager is None:
         raise HTTPException(status_code=500, detail="Connection manager not initialized")
-    
+
     peer_ip = notification.peer_ip
     peer_name = notification.peer_name
     local_ip = get_local_ip()
-    
+
+    print(f"📥 Received connection acceptance notification from {peer_name} ({peer_ip})")
+    logger.info(f"📥 Connection acceptance received from {peer_name} ({peer_ip})")
+
     # Only store the peer's connection, not our own IP
     # Each device should only track connections TO other devices, not to itself
     with connection_manager.lock:
@@ -320,8 +357,11 @@ async def receive_connection_accepted(notification: ConnectionAcceptedNotificati
             "connected_at": datetime.now().isoformat(),
             "status": "connected"
         }
-    
-    return {"status": "updated"}
+
+    print(f"✅ Connection established with {peer_name} ({peer_ip})")
+    logger.info(f"✅ Connection established with {peer_name} ({peer_ip})")
+
+    return {"status": "updated", "message": f"Connected to {peer_name}"}
 
 
 @router.post("/reject")

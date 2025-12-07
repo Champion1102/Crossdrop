@@ -15,7 +15,7 @@ CHUNK_SIZE = 64 * 1024  # 64KB - increased for better performance
 OPTIMAL_CHUNK_SIZE = 1024 * 1024  # 1MB - larger chunks for maximum throughput on fast networks
 STREAMING_BUFFER_SIZE = 16 * 1024 * 1024  # 16MB buffer for better TCP performance
 LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100MB - threshold for chunked streaming
-PROGRESS_UPDATE_INTERVAL = 10 * 1024 * 1024  # Update progress every 10MB to reduce callback overhead
+PROGRESS_UPDATE_INTERVAL = 1 * 1024 * 1024  # Update progress every 1MB for better UI responsiveness
 
 
 def get_downloads_folder() -> Path:
@@ -82,6 +82,10 @@ def receive_file(sock: socket.socket, save_dir: str = None, progress_callback: O
         
         with open(file_path, 'wb') as f:
             # Handle unknown file size (file_size = 0)
+            # Determine progress update frequency based on file size
+            # For small files (<10MB), update more frequently for better UI feedback
+            progress_interval = min(PROGRESS_UPDATE_INTERVAL, max(64 * 1024, file_size // 20 if file_size > 0 else 64 * 1024))
+
             if file_size == 0:
                 # Stream until connection closes
                 last_progress_update = 0
@@ -97,11 +101,11 @@ def receive_file(sock: socket.socket, save_dir: str = None, progress_callback: O
                         return None, None
                     f.write(chunk)
                     total_received += len(chunk)
-                    # Call progress callback periodically to reduce overhead
-                    if progress_callback and (total_received - last_progress_update) >= PROGRESS_UPDATE_INTERVAL:
+                    # Call progress callback periodically
+                    if progress_callback and (total_received - last_progress_update) >= progress_interval:
                         progress_callback(total_received)
                         last_progress_update = total_received
-                
+
                 # Final progress update
                 if progress_callback and total_received > last_progress_update:
                     progress_callback(total_received)
@@ -125,11 +129,11 @@ def receive_file(sock: socket.socket, save_dir: str = None, progress_callback: O
                         return None, None
                     f.write(chunk)
                     total_received += len(chunk)
-                    # Call progress callback periodically to reduce overhead
-                    if progress_callback and (total_received - last_progress_update) >= PROGRESS_UPDATE_INTERVAL:
+                    # Call progress callback periodically
+                    if progress_callback and (total_received - last_progress_update) >= progress_interval:
                         progress_callback(total_received)
                         last_progress_update = total_received
-                
+
                 # Final progress update
                 if progress_callback and total_received > last_progress_update:
                     progress_callback(total_received)
@@ -176,11 +180,13 @@ def send_file_from_stream(
     filename: str,
     file_size: int,
     port: int = TRANSFER_PORT,
-    use_optimized: bool = False
+    use_optimized: bool = False,
+    progress_callback: Optional[Callable[[int], None]] = None,
+    socket_store_callback: Optional[Callable[[socket.socket], None]] = None
 ) -> bool:
     """
     Send file data from a stream/memory buffer to a target IP address via TCP socket
-    
+
     Args:
         target_ip: IP address of the target device
         file_stream: File-like object or bytes to send
@@ -188,25 +194,31 @@ def send_file_from_stream(
         file_size: Size of the file in bytes
         port: TCP port to connect to (default: 9000)
         use_optimized: If True, use 64KB chunks and optimized socket settings
-    
+        progress_callback: Optional callback to report bytes sent
+        socket_store_callback: Optional callback to store socket for cancellation
+
     Returns:
         bool: True if successful, False otherwise
     """
     sock = None
     chunk_size = OPTIMAL_CHUNK_SIZE if use_optimized else CHUNK_SIZE
-    
+
     try:
         # Connect to target device
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         timeout = 60 if use_optimized else 30  # Longer timeout for large files
         sock.settimeout(timeout)
-        
+
         # Optimize socket for large files
         if use_optimized:
             _optimize_tcp_socket(sock)
-        
+
         sock.connect((target_ip, port))
-        
+
+        # Store socket for cancellation support
+        if socket_store_callback:
+            socket_store_callback(sock)
+
         # Send file metadata
         metadata = {
             'filename': filename,
@@ -214,16 +226,17 @@ def send_file_from_stream(
         }
         metadata_json = json.dumps(metadata).encode('utf-8')
         sock.send(metadata_json)
-        
+
         # Wait for acknowledgment
         ack = sock.recv(2)
         if ack != b'OK':
             print(f"Did not receive acknowledgment from {target_ip}")
             return False
-        
+
         # Send file data in chunks
         total_sent = 0
-        
+        last_progress_update = 0
+
         # Handle bytes object (most common case for FastAPI UploadFile.read())
         if isinstance(file_stream, bytes):
             while total_sent < file_size:
@@ -232,6 +245,10 @@ def send_file_from_stream(
                     break
                 sock.sendall(chunk)
                 total_sent += len(chunk)
+                # Update progress periodically
+                if progress_callback and (total_sent - last_progress_update) >= PROGRESS_UPDATE_INTERVAL:
+                    progress_callback(total_sent)
+                    last_progress_update = total_sent
         # Handle file-like object with read method
         elif hasattr(file_stream, 'read'):
             while total_sent < file_size:
@@ -240,12 +257,20 @@ def send_file_from_stream(
                     break
                 sock.sendall(chunk)
                 total_sent += len(chunk)
+                # Update progress periodically
+                if progress_callback and (total_sent - last_progress_update) >= PROGRESS_UPDATE_INTERVAL:
+                    progress_callback(total_sent)
+                    last_progress_update = total_sent
         else:
             print(f"Unsupported file stream type: {type(file_stream)}")
             return False
-        
+
+        # Final progress update
+        if progress_callback and total_sent > last_progress_update:
+            progress_callback(total_sent)
+
         return True
-        
+
     except socket.timeout:
         print(f"Timeout connecting to {target_ip}:{port}")
         return False
@@ -294,7 +319,11 @@ async def send_file_chunked_streaming(
         _optimize_tcp_socket(sock)
         
         sock.connect((target_ip, port))
-        
+
+        # Store socket for cancellation support
+        if socket_store_callback:
+            socket_store_callback(sock)
+
         # Send file metadata
         metadata = {
             'filename': filename,
@@ -302,13 +331,13 @@ async def send_file_chunked_streaming(
         }
         metadata_json = json.dumps(metadata).encode('utf-8')
         sock.send(metadata_json)
-        
+
         # Wait for acknowledgment
         ack = sock.recv(2)
         if ack != b'OK':
             print(f"Did not receive acknowledgment from {target_ip}")
             return False
-        
+
         # Stream file in optimized chunks directly from upload
         # Read and send in 256KB chunks for optimal TCP efficiency and throughput
         # Send chunks immediately for zero-copy performance

@@ -263,10 +263,10 @@ async def send_file_upload(
                 file_stream=file_content,
                 filename=filename,
                 file_size=file_size,
-                use_optimized=False  # Use standard chunk size for small files
+                use_optimized=False,  # Use standard chunk size for small files
+                progress_callback=update_send_progress,
+                socket_store_callback=store_socket
             )
-            # Update progress after sending
-            progress_tracker.update_progress(transfer_id, file_size)
         
         duration = time.time() - start_time
         
@@ -409,19 +409,7 @@ async def get_transfer_progress(local_ip: str = None):
     # Only return active transfers (not cancelled, completed, or failed)
     sending = [t for t in all_sending if t.get('status') == 'active']
     receiving = [t for t in all_receiving if t.get('status') == 'active']
-    
-    # Debug logging - show ALL transfers, not just active
-    print(f"🔍 DEBUG /transfer/progress called for IP: {local_ip}")
-    print(f"   All sending transfers: {len(all_sending)}")
-    for s in all_sending:
-        print(f"      - {s.get('filename')}: status={s.get('status')}, sender={s.get('sender_ip')}, receiver={s.get('receiver_ip')}")
-    print(f"   All receiving transfers: {len(all_receiving)}")
-    for r in all_receiving:
-        print(f"      - {r.get('filename')}: status={r.get('status')}, sender={r.get('sender_ip')}, receiver={r.get('receiver_ip')}")
-    print(f"   Filtered active receiving: {len(receiving)}")
-    for r in receiving:
-        print(f"      ✅ - {r.get('filename')}: status={r.get('status')}, progress={r.get('progress_percent')}%, bytes={r.get('bytes_transferred')}")
-    
+
     return {
         "sending": sending,
         "receiving": receiving

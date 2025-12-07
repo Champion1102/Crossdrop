@@ -1,9 +1,11 @@
 """
 Transfer service that manages TCP file transfer server in background
 """
+import os
 import socket
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -11,7 +13,6 @@ from typing import Optional
 from utils.file_handler import receive_file, log_transfer, get_downloads_folder
 from utils.network_utils import get_local_ip
 from utils.transfer_progress import progress_tracker
-import uuid
 
 
 class TransferService:

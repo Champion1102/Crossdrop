@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { getConnections, sendFileToDevice, getTransferHistory, disconnect } from '../api/backend';
+import config from '../config';
 
 const FileTransfer = () => {
   const [connections, setConnections] = useState([]);
@@ -71,7 +72,7 @@ const FileTransfer = () => {
       formData.append('target_ip', selectedDevice.peer_ip);
 
       // Upload and send file in one step
-      const uploadResponse = await fetch('http://localhost:8000/transfer/send', {
+      const uploadResponse = await fetch(`${config.API_BASE_URL}/transfer/send`, {
         method: 'POST',
         body: formData,
       });

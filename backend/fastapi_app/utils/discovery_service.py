@@ -24,10 +24,10 @@ logger = get_logger("discovery")
 
 class DiscoveryService:
     """Service for discovering and managing peer devices on LAN"""
-    
+
     BROADCAST_PORT = 8888
-    BROADCAST_INTERVAL = 2.0  # seconds
-    PEER_TIMEOUT = 6.0  # seconds - peer considered inactive if no message for this duration
+    BROADCAST_INTERVAL = 3.0  # seconds - broadcast presence every 3 seconds
+    PEER_TIMEOUT = 15.0  # seconds - peer considered inactive if no message for this duration (5x broadcast interval)
     
     def __init__(self, logs_dir: str = "logs"):
         self.device_name = get_device_name()
