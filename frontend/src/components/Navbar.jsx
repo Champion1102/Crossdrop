@@ -68,19 +68,11 @@ const Navbar = () => {
               to="/"
               className="flex items-center gap-2.5 group"
             >
-              <div className="w-8 h-8 rounded-lg bg-[var(--color-primary)] flex items-center justify-center">
-                <svg
-                  viewBox="0 0 24 24"
-                  className="w-5 h-5 text-white"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="M12 5v14M5 12h14" />
-                </svg>
-              </div>
+              <img 
+                src="/crossdrop_logo.png" 
+                alt="CrossDrop Logo" 
+                className="h-10 w-auto"
+              />
               <span className="font-semibold text-lg text-[var(--color-text-primary)]">
                 CrossDrop
               </span>
@@ -124,7 +116,7 @@ const Navbar = () => {
 
               {/* GitHub Link */}
               <a
-                href="https://github.com"
+                href="https://github.com/Champion1102/Crossdrop"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="hidden sm:flex p-2 rounded-lg text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-colors"

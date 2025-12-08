@@ -382,7 +382,7 @@ const Home = () => {
                   Get Started Free
                 </Link>
                 <a
-                  href="https://github.com"
+                  href="https://github.com/Champion1102/Crossdrop"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="btn btn-lg bg-white/10 text-white border border-white/20 hover:bg-white/20 w-full sm:w-auto"
@@ -415,7 +415,7 @@ const Home = () => {
             </p>
             <div className="flex items-center gap-4">
               <a
-                href="https://github.com"
+                href="https://github.com/Champion1102/Crossdrop"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] transition-colors"
