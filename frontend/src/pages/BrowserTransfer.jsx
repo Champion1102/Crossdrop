@@ -1,679 +1,538 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
 import webrtcService from '../services/webrtc';
-import { generateRoomId, checkHealth } from '../api/signaling';
+import { generateRoomId, checkHealth, checkRoomExists } from '../api/signaling';
+
+// Bird SVG component
+const Bird = ({ className = "", style = {} }) => (
+  <svg viewBox="0 0 50 20" fill="currentColor" className={className} style={style}>
+    <path d="M0 10 Q 12 0, 25 10 Q 38 0, 50 10 Q 38 5, 25 10 Q 12 5, 0 10" />
+  </svg>
+);
+
+// Cloud component
+const Cloud = ({ className = "", size = "medium" }) => {
+  const sizes = {
+    small: "w-32 h-16",
+    medium: "w-48 h-24",
+    large: "w-72 h-36"
+  };
+
+  return (
+    <div className={`absolute ${sizes[size]} ${className}`}>
+      <svg viewBox="0 0 200 100" className="w-full h-full">
+        <ellipse cx="60" cy="60" rx="50" ry="35" fill="rgba(255,255,255,0.7)" />
+        <ellipse cx="100" cy="50" rx="45" ry="40" fill="rgba(255,255,255,0.8)" />
+        <ellipse cx="140" cy="60" rx="50" ry="35" fill="rgba(255,255,255,0.7)" />
+        <ellipse cx="80" cy="45" rx="35" ry="30" fill="rgba(255,255,255,0.85)" />
+        <ellipse cx="120" cy="45" rx="35" ry="30" fill="rgba(255,255,255,0.85)" />
+      </svg>
+    </div>
+  );
+};
+
+// Step indicator
+const Steps = ({ current }) => (
+  <div className="flex items-center justify-center gap-2 mb-8">
+    {[1, 2, 3].map((step) => (
+      <div
+        key={step}
+        className={`w-2 h-2 rounded-full transition-all duration-300 ${
+          step === current ? 'w-8 bg-gray-600' : step < current ? 'bg-gray-400' : 'bg-gray-300'
+        }`}
+      />
+    ))}
+  </div>
+);
 
 const BrowserTransfer = () => {
+  const navigate = useNavigate();
+
+  // Flow state: 'choice' | 'join-input' | 'room'
+  const [step, setStep] = useState('choice');
+
   // Connection state
   const [roomId, setRoomId] = useState('');
   const [inputRoomId, setInputRoomId] = useState('');
-  const [deviceName, setDeviceName] = useState(() => {
-    return localStorage.getItem('crossdrop_device_name') || `Browser-${Math.random().toString(36).substr(2, 4)}`;
-  });
-  const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
-  const [isReconnecting, setIsReconnecting] = useState(false);
-  const [connectionState, setConnectionState] = useState('disconnected'); // disconnected, connecting, connected, reconnecting, unstable
-  const [peerId, setPeerId] = useState(null);
+  const [isConnected, setIsConnected] = useState(false);
   const [peers, setPeers] = useState([]);
+  const [selectedPeer, setSelectedPeer] = useState(null);
   const [signalingAvailable, setSignalingAvailable] = useState(null);
 
   // File transfer state
   const [selectedFile, setSelectedFile] = useState(null);
-  const [selectedPeer, setSelectedPeer] = useState(null);
   const [transferProgress, setTransferProgress] = useState(null);
   const [pendingFileRequest, setPendingFileRequest] = useState(null);
-  const [transferHistory, setTransferHistory] = useState([]);
+  const [isDragging, setIsDragging] = useState(false);
 
-  // Reconnection state
-  const [reconnectInfo, setReconnectInfo] = useState(null);
+  // Completion modal
+  const [showCompletionModal, setShowCompletionModal] = useState(false);
+  const [completedTransfer, setCompletedTransfer] = useState(null);
 
   const fileInputRef = useRef(null);
+  const dropZoneRef = useRef(null);
 
-  // Check if signaling server is available
+  // Device name
+  const deviceName = useRef(
+    localStorage.getItem('crossdrop_device_name') || `Device-${Math.random().toString(36).substr(2, 4)}`
+  ).current;
+
+  // Check signaling server
   useEffect(() => {
-    const checkSignaling = async () => {
-      try {
-        await checkHealth();
-        setSignalingAvailable(true);
-      } catch (error) {
-        console.error('Signaling server not available:', error);
-        setSignalingAvailable(false);
-      }
-    };
-    checkSignaling();
-
-    // Re-check periodically
-    const interval = setInterval(checkSignaling, 30000);
-    return () => clearInterval(interval);
+    checkHealth()
+      .then(() => setSignalingAvailable(true))
+      .catch(() => setSignalingAvailable(false));
   }, []);
 
-  // Setup WebRTC event handlers
+  // Cleanup on unmount only (no dependencies to avoid disconnecting on state changes)
   useEffect(() => {
+    // On mount, ensure no stale connections
+    if (webrtcService.isConnected() && !roomId) {
+      console.warn('Cleaning up stale WebRTC connection on mount');
+      webrtcService.disconnect();
+    }
+
+    return () => {
+      // Only disconnect on component unmount
+      if (webrtcService.isConnected()) {
+        console.log('Component unmounting, disconnecting WebRTC');
+        webrtcService.disconnect();
+      }
+    };
+  }, []); // Empty deps - only run on mount/unmount
+
+  // Handle page visibility changes - just for logging, connection persists
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        console.log('Page hidden - connection maintained');
+      } else {
+        console.log('Page visible again - connection maintained');
+        // Don't check connection here - let the WebRTC service handle reconnection via onDisconnected callback
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, []); // Empty deps - listener doesn't need to change
+
+  // Setup WebRTC handlers
+  useEffect(() => {
+    // Track if component is mounted
+    let isMounted = true;
+
     webrtcService.onConnected = (data) => {
-      console.log('Connected to room:', data);
+      if (!isMounted) return; // Prevent state updates after unmount
       setIsConnected(true);
       setIsConnecting(false);
-      setIsReconnecting(false);
-      setConnectionState('connected');
-      setReconnectInfo(null);
-      setPeerId(data.peerId);
       setRoomId(data.roomId);
       setPeers(data.peers || []);
-      toast.success(`Connected to room ${data.roomId}`);
+      setStep('room');
+      toast.success('Connected to room');
     };
 
     webrtcService.onDisconnected = () => {
+      if (!isMounted) return; // Prevent state updates after unmount
       setIsConnected(false);
-      setIsReconnecting(false);
-      setConnectionState('disconnected');
-      setReconnectInfo(null);
-      setPeerId(null);
       setPeers([]);
       setSelectedPeer(null);
-      toast('Disconnected from room');
-    };
-
-    webrtcService.onReconnecting = (info) => {
-      console.log('Reconnecting:', info);
-      setIsReconnecting(true);
-      setConnectionState('reconnecting');
-      setReconnectInfo(info);
-      toast(`Reconnecting... (attempt ${info.attempt}/${info.maxAttempts})`);
-    };
-
-    webrtcService.onReconnected = () => {
-      console.log('Reconnected successfully');
-      setIsReconnecting(false);
-      setConnectionState('connected');
-      setReconnectInfo(null);
-      toast.success('Reconnected successfully!');
-    };
-
-    webrtcService.onConnectionStateChange = (state) => {
-      console.log('Connection state changed:', state);
-      setConnectionState(state);
-
-      if (state === 'unstable') {
-        toast('Connection unstable, attempting to recover...', { icon: '⚠️' });
-      } else if (state === 'offline') {
-        toast('You are offline. Will reconnect when back online.', { icon: '📡' });
+      setSelectedFile(null);
+      setTransferProgress(null);
+      setPendingFileRequest(null);
+      if (step !== 'choice') {
+        setStep('choice');
       }
     };
 
     webrtcService.onPeerJoined = (data) => {
-      console.log('Peer joined event received:', data);
-      console.log('New peers list:', data.peers);
-      const newPeers = data.peers || [];
-      setPeers(newPeers);
-      console.log('setPeers called with:', newPeers);
-      toast.success(`${data.deviceName} joined the room`);
+      if (!isMounted) return;
+      setPeers(prev => {
+        if (prev.some(p => p.peerId === data.peerId)) return prev;
+        const newPeers = [...prev, { peerId: data.peerId, deviceName: data.deviceName }];
+        toast.success(`${data.deviceName} joined the room`);
+        return newPeers;
+      });
     };
 
     webrtcService.onPeerLeft = (data) => {
-      console.log('Peer left:', data);
-      setPeers(data.peers || []);
-      if (selectedPeer?.peerId === data.peerId) {
-        setSelectedPeer(null);
-      }
-      toast(`A peer left the room`);
-    };
-
-    webrtcService.onPeerConnectionReady = (data) => {
-      console.log('Peer connection ready:', data);
-      // Force re-render to update the connection status indicator
-      setPeers(prevPeers => [...prevPeers]);
-      if (data.ready) {
-        toast.success('Peer connection established!');
-      }
+      if (!isMounted) return;
+      setPeers(prev => {
+        const peer = prev.find(p => p.peerId === data.peerId);
+        if (peer) {
+          toast(`${peer.deviceName} left the room`, { icon: '👋' });
+        }
+        return prev.filter(p => p.peerId !== data.peerId);
+      });
+      if (selectedPeer?.peerId === data.peerId) setSelectedPeer(null);
     };
 
     webrtcService.onError = (error) => {
+      if (!isMounted) return; // Prevent state updates after unmount
       console.error('WebRTC error:', error);
-      toast.error(error || 'Connection error');
       setIsConnecting(false);
+      if (typeof error === 'string') {
+        toast.error(error);
+      }
     };
 
     webrtcService.onFileRequest = (data) => {
-      console.log('File request received:', data);
       setPendingFileRequest(data);
     };
 
     webrtcService.onFileAccepted = (data) => {
-      console.log('File accepted, starting transfer');
-      toast.success('File transfer accepted, sending...');
       webrtcService.startFileSend(data.fromPeerId);
     };
 
-    webrtcService.onFileRejected = (data) => {
-      console.log('File rejected:', data);
-      toast.error(`File transfer rejected: ${data.reason || 'Unknown reason'}`);
+    webrtcService.onFileRejected = () => {
       setTransferProgress(null);
     };
 
     webrtcService.onFileProgress = (data) => {
-      setTransferProgress({
-        ...data,
-        speed: calculateSpeed(data)
-      });
+      setTransferProgress(data);
     };
 
     webrtcService.onFileComplete = (data) => {
-      console.log('File transfer complete:', data);
-      toast.success(
-        `File ${data.direction === 'send' ? 'sent' : 'received'}: ${data.fileInfo.name}`
-      );
       setTransferProgress(null);
       setSelectedFile(null);
-
-      // Add to history
-      setTransferHistory(prev => [{
-        filename: data.fileInfo.name,
-        size: data.fileInfo.size,
-        direction: data.direction,
-        peerId: data.targetPeerId || data.fromPeerId,
-        timestamp: new Date().toISOString(),
-        status: 'success'
-      }, ...prev].slice(0, 20));
+      setCompletedTransfer(data);
+      setShowCompletionModal(true);
     };
 
-    webrtcService.onFileError = (data) => {
-      console.error('File transfer error:', data);
-      toast.error(`Transfer failed: ${data.error}`);
+    webrtcService.onFileError = () => {
       setTransferProgress(null);
     };
 
     return () => {
-      // Clean up
-      webrtcService.onConnected = null;
-      webrtcService.onDisconnected = null;
-      webrtcService.onReconnecting = null;
-      webrtcService.onReconnected = null;
-      webrtcService.onConnectionStateChange = null;
-      webrtcService.onPeerJoined = null;
-      webrtcService.onPeerLeft = null;
-      webrtcService.onPeerConnectionReady = null;
-      webrtcService.onError = null;
-      webrtcService.onFileRequest = null;
-      webrtcService.onFileAccepted = null;
-      webrtcService.onFileRejected = null;
-      webrtcService.onFileProgress = null;
-      webrtcService.onFileComplete = null;
-      webrtcService.onFileError = null;
+      isMounted = false;
+      Object.keys(webrtcService).forEach(key => {
+        if (key.startsWith('on')) webrtcService[key] = null;
+      });
     };
-  }, [selectedPeer]);
+  }, [selectedPeer, step]);
 
-  // Speed calculation helper
-  const lastProgressRef = useRef({ bytes: 0, time: Date.now() });
-  const calculateSpeed = (data) => {
-    const now = Date.now();
-    const bytes = data.bytesSent || data.bytesReceived || 0;
-    const timeDiff = (now - lastProgressRef.current.time) / 1000;
-    const bytesDiff = bytes - lastProgressRef.current.bytes;
+  // Drag and drop handlers
+  const handleDragOver = useCallback((e) => {
+    e.preventDefault();
+    setIsDragging(true);
+  }, []);
 
-    let speed = 0;
-    if (timeDiff > 0) {
-      speed = (bytesDiff / timeDiff) / (1024 * 1024); // MB/s
-    }
+  const handleDragLeave = useCallback((e) => {
+    e.preventDefault();
+    setIsDragging(false);
+  }, []);
 
-    lastProgressRef.current = { bytes, time: now };
-    return Math.max(0, speed);
-  };
+  const handleDrop = useCallback((e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files[0];
+    if (file) setSelectedFile(file);
+  }, []);
 
-  // Save device name to localStorage
-  useEffect(() => {
-    localStorage.setItem('crossdrop_device_name', deviceName);
-  }, [deviceName]);
-
-  // Poll for connection status updates while peers are connecting
-  useEffect(() => {
-    if (!isConnected || peers.length === 0) return;
-
-    // Check if any peers are still connecting
-    const hasConnectingPeers = peers.some(peer => !webrtcService.isConnectedTo(peer.peerId));
-
-    if (!hasConnectingPeers) return;
-
-    // Poll every 500ms to update UI while connections are establishing
-    const pollInterval = setInterval(() => {
-      // Force re-render to update connection statuses
-      setPeers(prevPeers => [...prevPeers]);
-
-      // Check if all peers are now connected
-      const stillConnecting = peers.some(peer => !webrtcService.isConnectedTo(peer.peerId));
-      if (!stillConnecting) {
-        clearInterval(pollInterval);
-      }
-    }, 500);
-
-    return () => clearInterval(pollInterval);
-  }, [isConnected, peers]);
-
-  // Create a new room
+  // Actions
   const handleCreateRoom = async () => {
-    const newRoomId = generateRoomId();
     setIsConnecting(true);
-
     try {
+      const newRoomId = generateRoomId();
       await webrtcService.connect(newRoomId, deviceName);
+      // Success handling is done in onConnected callback
     } catch (error) {
-      console.error('Failed to create room:', error);
+      console.error('Error creating room:', error);
+      toast.error('Failed to create room. Please try again.');
       setIsConnecting(false);
     }
   };
 
-  // Join an existing room
   const handleJoinRoom = async () => {
-    if (!inputRoomId.trim()) {
-      toast.error('Please enter a room ID');
-      return;
-    }
-
+    if (!inputRoomId.trim()) return;
     setIsConnecting(true);
+    const roomIdUpper = inputRoomId.toUpperCase();
 
     try {
-      await webrtcService.connect(inputRoomId.toUpperCase(), deviceName);
+      // First check if room exists
+      const exists = await checkRoomExists(roomIdUpper);
+
+      if (!exists) {
+        toast.error('Room not found. Please check the code and try again.');
+        setIsConnecting(false);
+        return;
+      }
+
+      // Room exists, proceed to join
+      await webrtcService.connect(roomIdUpper, deviceName);
     } catch (error) {
-      console.error('Failed to join room:', error);
+      console.error('Error joining room:', error);
+      toast.error('Failed to join room. Please try again.');
       setIsConnecting(false);
     }
   };
 
-  // Leave the room
   const handleLeaveRoom = () => {
     webrtcService.disconnect();
     setRoomId('');
+    setInputRoomId('');
     setIsConnected(false);
-    setPeerId(null);
+    setIsConnecting(false);
     setPeers([]);
     setSelectedPeer(null);
     setSelectedFile(null);
     setTransferProgress(null);
+    setPendingFileRequest(null);
+    setStep('choice');
   };
 
-  // Handle file selection
+  const handleBackButton = () => {
+    if (step === 'room' && isConnected) {
+      // If in room, leave it first
+      handleLeaveRoom();
+    } else if (step === 'join-input') {
+      // Just go back to choice
+      setInputRoomId('');
+      setStep('choice');
+    } else {
+      // Navigate home
+      navigate('/');
+    }
+  };
+
   const handleFileSelect = (e) => {
     const file = e.target.files?.[0];
-    if (file) {
-      setSelectedFile(file);
-      toast.success(`Selected: ${file.name}`);
-    }
+    if (file) setSelectedFile(file);
   };
 
-  // Send file to selected peer
   const handleSendFile = () => {
-    if (!selectedFile || !selectedPeer) {
-      toast.error('Select a file and a peer first');
-      return;
-    }
-
-    if (!webrtcService.isConnectedTo(selectedPeer.peerId)) {
-      toast.error('Not connected to this peer yet. Please wait...');
-      return;
-    }
-
+    if (!selectedFile || !selectedPeer) return;
+    if (!webrtcService.isConnectedTo(selectedPeer.peerId)) return;
     webrtcService.requestFileSend(selectedPeer.peerId, selectedFile);
-    toast('Requesting file transfer...');
   };
 
-  // Accept incoming file
   const handleAcceptFile = () => {
     if (!pendingFileRequest) return;
     webrtcService.acceptFileTransfer(pendingFileRequest.fromPeerId, pendingFileRequest.fileInfo);
     setPendingFileRequest(null);
   };
 
-  // Reject incoming file
   const handleRejectFile = () => {
     if (!pendingFileRequest) return;
-    webrtcService.rejectFileTransfer(pendingFileRequest.fromPeerId, 'User declined');
+    webrtcService.rejectFileTransfer(pendingFileRequest.fromPeerId, 'Declined');
     setPendingFileRequest(null);
   };
 
-  // Copy room ID to clipboard
   const copyRoomId = () => {
     navigator.clipboard.writeText(roomId);
-    toast.success('Room ID copied to clipboard!');
+    toast.success('Room code copied to clipboard');
   };
 
-  // Format file size
   const formatFileSize = (bytes) => {
     if (!bytes) return '0 B';
     if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
-    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
   };
 
   return (
-    <div className="min-h-screen bg-[var(--color-bg)]">
-      <div className="container-default py-8 lg:py-12">
-        {/* Header */}
-        <motion.div
-          className="mb-8 text-center"
-          initial={{ opacity: 0, y: -20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5 }}
-        >
-          <span className="badge badge-primary mb-4 inline-flex">
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" />
-            </svg>
-            WebRTC Powered
-          </span>
-          <h1 className="heading-lg mb-3">Browser Transfer</h1>
-          <p className="text-body-lg max-w-xl mx-auto">
-            Share files directly between browsers anywhere in the world. No installation required.
-          </p>
-        </motion.div>
+    <div className="sky-bg min-h-screen relative overflow-hidden">
+      {/* Grain overlay */}
+      <div className="grain-overlay" />
 
-        {/* Signaling Server Status */}
+      {/* Clouds */}
+      <Cloud size="large" className="top-20 -left-10 opacity-60 animate-float-slow" />
+      <Cloud size="medium" className="top-40 right-20 opacity-50 animate-float" />
+      <Cloud size="small" className="bottom-32 left-1/4 opacity-40 animate-float-slow" />
+
+      {/* Birds */}
+      <Bird className="absolute top-28 left-1/3 w-8 h-4 text-gray-500/50 animate-bird" />
+      <Bird className="absolute top-36 right-1/4 w-6 h-3 text-gray-400/40 animate-bird" style={{ animationDelay: '0.5s' }} />
+
+      {/* Main content */}
+      <div className="relative z-10 min-h-screen flex flex-col items-center justify-center px-6 py-12">
+
+        {/* Back button */}
+        <motion.button
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          onClick={handleBackButton}
+          className="absolute top-6 left-6 btn-ghost"
+        >
+          <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18" />
+          </svg>
+          Back
+        </motion.button>
+
+        {/* Server unavailable warning */}
         <AnimatePresence>
           {signalingAvailable === false && (
             <motion.div
-              className="card mb-6 border-[var(--color-error)] bg-[var(--color-error-light)]"
-              initial={{ opacity: 0, y: -10 }}
+              initial={{ opacity: 0, y: -20 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="absolute top-6 left-1/2 -translate-x-1/2 glass-card px-4 py-2 text-sm text-red-600"
             >
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-lg bg-[var(--color-error)]/20 flex items-center justify-center flex-shrink-0">
-                  <svg className="w-5 h-5 text-[var(--color-error)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                  </svg>
-                </div>
-                <div>
-                  <p className="font-medium text-[var(--color-error)]">Signaling server unavailable</p>
-                  <p className="text-sm text-[var(--color-text-secondary)]">
-                    Make sure the signaling server is running on port 3001
-                  </p>
-                </div>
-              </div>
+              Server unavailable
             </motion.div>
           )}
         </AnimatePresence>
 
-        {/* Main Content */}
-        <div className="max-w-4xl mx-auto">
-          {/* Not Connected - Show Join/Create */}
-          {!isConnected && (
+        {/* STEP 1: Choice - Create or Join */}
+        <AnimatePresence mode="wait">
+          {step === 'choice' && !isConnected && (
             <motion.div
+              key="choice"
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.5 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="w-full max-w-md text-center"
             >
-              {/* Device Name Card */}
-              <div className="card mb-6">
-                <label className="block text-sm font-medium text-[var(--color-text-primary)] mb-2">
-                  Your Device Name
-                </label>
-                <input
-                  type="text"
-                  value={deviceName}
-                  onChange={(e) => setDeviceName(e.target.value)}
-                  className="input"
-                  placeholder="My Device"
-                />
-                <p className="text-xs text-[var(--color-text-tertiary)] mt-2">
-                  This name will be visible to other peers in the room
-                </p>
-              </div>
+              <Bird className="w-16 h-7 text-gray-600/60 mx-auto mb-6 animate-bird" />
 
-              {/* Create/Join Cards */}
-              <div className="grid md:grid-cols-2 gap-6">
-                {/* Create Room */}
-                <div className="card card-hover">
-                  <div className="w-12 h-12 rounded-xl bg-[var(--color-primary)]/10 flex items-center justify-center mb-4">
-                    <svg className="w-6 h-6 text-[var(--color-primary)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+              <h1 className="heading-page mb-4">Start sharing</h1>
+              <p className="text-artistic mb-10">
+                Create a room or join one to begin
+              </p>
+
+              <div className="space-y-4">
+                <button
+                  onClick={handleCreateRoom}
+                  disabled={isConnecting || signalingAvailable === false}
+                  className="btn-golden w-full"
+                >
+                  {isConnecting ? (
+                    <svg className="w-5 h-5 animate-spin-slow" viewBox="0 0 24 24" fill="none">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                     </svg>
-                  </div>
-                  <h3 className="text-lg font-semibold text-[var(--color-text-primary)] mb-2">
-                    Create New Room
-                  </h3>
-                  <p className="text-sm text-[var(--color-text-secondary)] mb-4">
-                    Create a room and share the code with others to connect.
-                  </p>
-                  <button
-                    onClick={handleCreateRoom}
-                    disabled={isConnecting || signalingAvailable === false}
-                    className="btn btn-primary w-full"
-                  >
-                    {isConnecting ? (
-                      <>
-                        <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                        </svg>
-                        Creating...
-                      </>
-                    ) : (
-                      'Create Room'
-                    )}
-                  </button>
-                </div>
+                  ) : (
+                    <>
+                      <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+                      </svg>
+                      Create Room
+                    </>
+                  )}
+                </button>
 
-                {/* Join Room */}
-                <div className="card card-hover">
-                  <div className="w-12 h-12 rounded-xl bg-[var(--color-success)]/10 flex items-center justify-center mb-4">
-                    <svg className="w-6 h-6 text-[var(--color-success)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" />
-                    </svg>
-                  </div>
-                  <h3 className="text-lg font-semibold text-[var(--color-text-primary)] mb-2">
-                    Join Existing Room
-                  </h3>
-                  <p className="text-sm text-[var(--color-text-secondary)] mb-3">
-                    Enter a room code to join.
-                  </p>
-                  <input
-                    type="text"
-                    value={inputRoomId}
-                    onChange={(e) => setInputRoomId(e.target.value.toUpperCase())}
-                    className="input mb-3 text-center font-mono text-lg tracking-widest uppercase"
-                    placeholder="ROOM ID"
-                    maxLength={6}
-                  />
-                  <button
-                    onClick={handleJoinRoom}
-                    disabled={isConnecting || !inputRoomId.trim() || signalingAvailable === false}
-                    className="btn btn-secondary w-full border-[var(--color-success)] text-[var(--color-success)] hover:bg-[var(--color-success)]/10"
-                  >
-                    {isConnecting ? (
-                      <>
-                        <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                        </svg>
-                        Joining...
-                      </>
-                    ) : (
-                      'Join Room'
-                    )}
-                  </button>
-                </div>
-              </div>
-
-              {/* How it works */}
-              <div className="card mt-8 bg-[var(--color-bg-secondary)]">
-                <h3 className="text-lg font-semibold text-[var(--color-text-primary)] mb-4">
-                  How Browser Transfer Works
-                </h3>
-                <div className="grid sm:grid-cols-4 gap-4">
-                  {[
-                    { step: '1', title: 'Create or Join', desc: 'Start a new room or join with a code' },
-                    { step: '2', title: 'Connect', desc: 'WebRTC establishes direct connection' },
-                    { step: '3', title: 'Transfer', desc: 'Files sent peer-to-peer directly' },
-                    { step: '4', title: 'Secure', desc: 'End-to-end encrypted by WebRTC' },
-                  ].map((item) => (
-                    <div key={item.step} className="text-center">
-                      <div className="w-8 h-8 rounded-full bg-[var(--color-primary)] text-white font-semibold flex items-center justify-center mx-auto mb-2">
-                        {item.step}
-                      </div>
-                      <h4 className="font-medium text-[var(--color-text-primary)] text-sm">{item.title}</h4>
-                      <p className="text-xs text-[var(--color-text-tertiary)]">{item.desc}</p>
-                    </div>
-                  ))}
-                </div>
+                <button
+                  onClick={() => setStep('join-input')}
+                  disabled={isConnecting || signalingAvailable === false}
+                  className="btn-outline w-full"
+                >
+                  Join Room
+                </button>
               </div>
             </motion.div>
           )}
 
-          {/* Connected - Show Room Info */}
-          {isConnected && (
+          {/* STEP 1.5: Join Input */}
+          {step === 'join-input' && !isConnected && (
             <motion.div
+              key="join-input"
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.5 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="w-full max-w-md text-center"
             >
-              {/* Room Info Card */}
-              <div className="card mb-6">
-                <div className="flex items-center justify-between flex-wrap gap-4">
-                  <div>
-                    <div className="flex items-center gap-2 mb-1">
-                      <p className="text-sm text-[var(--color-text-tertiary)]">Room ID</p>
-                      {/* Connection Status Indicator */}
-                      <div className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium ${
-                        connectionState === 'connected'
-                          ? 'bg-[var(--color-success)]/10 text-[var(--color-success)]'
-                          : connectionState === 'reconnecting'
-                          ? 'bg-[var(--color-warning)]/10 text-[var(--color-warning)]'
-                          : connectionState === 'unstable'
-                          ? 'bg-[var(--color-warning)]/10 text-[var(--color-warning)]'
-                          : 'bg-[var(--color-error)]/10 text-[var(--color-error)]'
-                      }`}>
-                        <div className={`w-2 h-2 rounded-full ${
-                          connectionState === 'connected'
-                            ? 'bg-[var(--color-success)] animate-pulse'
-                            : connectionState === 'reconnecting'
-                            ? 'bg-[var(--color-warning)] animate-pulse'
-                            : connectionState === 'unstable'
-                            ? 'bg-[var(--color-warning)]'
-                            : 'bg-[var(--color-error)]'
-                        }`} />
-                        {connectionState === 'connected' && 'Connected'}
-                        {connectionState === 'reconnecting' && `Reconnecting${reconnectInfo ? ` (${reconnectInfo.attempt}/${reconnectInfo.maxAttempts})` : '...'}`}
-                        {connectionState === 'unstable' && 'Unstable'}
-                        {connectionState === 'offline' && 'Offline'}
-                        {connectionState === 'disconnected' && 'Disconnected'}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <span className="text-3xl font-bold font-mono text-[var(--color-primary)] tracking-widest">
-                        {roomId}
-                      </span>
-                      <button
-                        onClick={copyRoomId}
-                        className="btn btn-ghost btn-icon"
-                        title="Copy room ID"
-                      >
-                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                        </svg>
-                      </button>
-                    </div>
-                    <p className="text-sm text-[var(--color-text-secondary)] mt-1">
-                      Share this code with others to connect
-                    </p>
-                  </div>
-                  <button
-                    onClick={handleLeaveRoom}
-                    className="btn btn-secondary border-[var(--color-error)] text-[var(--color-error)] hover:bg-[var(--color-error)]/10"
-                  >
-                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+              <h1 className="heading-page mb-4">Join room</h1>
+              <p className="text-artistic mb-8">
+                Enter the room code to connect
+              </p>
+
+              <input
+                type="text"
+                value={inputRoomId}
+                onChange={(e) => setInputRoomId(e.target.value.toUpperCase())}
+                placeholder="ROOM CODE"
+                maxLength={6}
+                autoFocus
+                className="input-artistic mb-6"
+              />
+
+              <button
+                onClick={handleJoinRoom}
+                disabled={isConnecting || !inputRoomId.trim()}
+                className="btn-golden w-full"
+              >
+                {isConnecting ? (
+                  <svg className="w-5 h-5 animate-spin-slow" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                ) : (
+                  'Join'
+                )}
+              </button>
+            </motion.div>
+          )}
+
+          {/* STEP 2: Room View */}
+          {step === 'room' && isConnected && (
+            <motion.div
+              key="room"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="w-full max-w-2xl"
+            >
+              {/* Room code display */}
+              <div className="text-center mb-8">
+                <p className="text-sm text-gray-500 mb-2">Room Code</p>
+                <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
+                  <span className="room-code">{roomId}</span>
+                  <button onClick={copyRoomId} className="btn-ghost sm:relative sm:top-0" title="Copy room code">
+                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
                     </svg>
-                    Leave Room
+                    <span className="sm:hidden">Copy Code</span>
                   </button>
                 </div>
               </div>
 
-              {/* Two Column Layout */}
-              <div className="grid lg:grid-cols-2 gap-6">
-                {/* Peers List */}
-                <div className="card">
-                  <div className="flex items-center justify-between mb-4">
-                    <h2 className="text-lg font-semibold text-[var(--color-text-primary)]">
-                      Connected Peers
-                    </h2>
-                    <span className="badge badge-neutral">
-                      {peers.length} {peers.length === 1 ? 'peer' : 'peers'}
-                    </span>
-                  </div>
+              <div className="grid md:grid-cols-2 gap-6">
+                {/* Peers */}
+                <div className="glass-card p-6">
+                  <h2 className="heading-section mb-4">
+                    {peers.length === 0 ? 'Waiting for peers...' : 'Connected'}
+                  </h2>
 
                   {peers.length === 0 ? (
-                    <div className="text-center py-12">
-                      <div className="w-16 h-16 rounded-full bg-[var(--color-bg-tertiary)] flex items-center justify-center mx-auto mb-4">
-                        <svg className="w-8 h-8 text-[var(--color-text-tertiary)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+                    <div className="text-center py-8">
+                      <div className="w-12 h-12 mx-auto mb-4 rounded-full bg-gray-100 flex items-center justify-center">
+                        <svg className="w-6 h-6 text-gray-400 animate-pulse-soft" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M18 18.72a9.094 9.094 0 003.741-.479 3 3 0 00-4.682-2.72m.94 3.198l.001.031c0 .225-.012.447-.037.666A11.944 11.944 0 0112 21c-2.17 0-4.207-.576-5.963-1.584A6.062 6.062 0 016 18.719m12 0a5.971 5.971 0 00-.941-3.197m0 0A5.995 5.995 0 0012 12.75a5.995 5.995 0 00-5.058 2.772m0 0a3 3 0 00-4.681 2.72 8.986 8.986 0 003.74.477m.94-3.197a5.971 5.971 0 00-.94 3.197M15 6.75a3 3 0 11-6 0 3 3 0 016 0zm6 3a2.25 2.25 0 11-4.5 0 2.25 2.25 0 014.5 0zm-13.5 0a2.25 2.25 0 11-4.5 0 2.25 2.25 0 014.5 0z" />
                         </svg>
                       </div>
-                      <p className="text-[var(--color-text-secondary)] font-medium mb-1">
-                        Waiting for others to join
-                      </p>
-                      <p className="text-sm text-[var(--color-text-tertiary)]">
-                        Share the room code above
-                      </p>
+                      <p className="text-gray-500 text-sm">Share the room code above</p>
                     </div>
                   ) : (
-                    <div className="space-y-2">
+                    <div className="space-y-3">
                       {peers.map((peer) => {
+                        const isReady = webrtcService.isConnectedTo(peer.peerId);
                         const isSelected = selectedPeer?.peerId === peer.peerId;
-                        const isConnectedToPeer = webrtcService.isConnectedTo(peer.peerId);
-                        const connectionStatus = webrtcService.getPeerConnectionStatus(peer.peerId);
-
-                        // Determine status text and color
-                        let statusText = 'Establishing connection...';
-                        let statusColor = 'bg-[var(--color-warning)]';
-
-                        if (isConnectedToPeer) {
-                          statusText = 'Ready to transfer';
-                          statusColor = 'bg-[var(--color-success)]';
-                        } else if (connectionStatus.iceConnectionState === 'checking') {
-                          statusText = 'Connecting...';
-                        } else if (connectionStatus.iceConnectionState === 'failed') {
-                          statusText = 'Connection failed';
-                          statusColor = 'bg-[var(--color-error)]';
-                        } else if (connectionStatus.iceConnectionState === 'disconnected') {
-                          statusText = 'Reconnecting...';
-                        }
 
                         return (
                           <div
                             key={peer.peerId}
                             onClick={() => setSelectedPeer(isSelected ? null : peer)}
-                            className={`p-4 rounded-xl border-2 cursor-pointer transition-all ${
-                              isSelected
-                                ? 'border-[var(--color-primary)] bg-[var(--color-primary)]/5'
-                                : 'border-[var(--color-border)] hover:border-[var(--color-border)]'
-                            }`}
+                            className={`peer-card ${isSelected ? 'selected' : ''}`}
                           >
-                            <div className="flex items-center justify-between">
-                              <div className="flex items-center gap-3">
-                                <div className="relative">
-                                  <div className="w-10 h-10 rounded-lg bg-[var(--color-bg-tertiary)] flex items-center justify-center">
-                                    <svg className="w-5 h-5 text-[var(--color-text-secondary)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                                      <path strokeLinecap="round" strokeLinejoin="round" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                                    </svg>
-                                  </div>
-                                  <div className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-[var(--color-surface)] ${statusColor} ${
-                                    !isConnectedToPeer && connectionStatus.iceConnectionState !== 'failed' ? 'animate-pulse' : ''
-                                  }`} />
-                                </div>
-                                <div>
-                                  <h3 className="font-medium text-[var(--color-text-primary)]">
-                                    {peer.deviceName}
-                                  </h3>
-                                  <p className="text-xs text-[var(--color-text-tertiary)]">
-                                    {statusText}
-                                  </p>
-                                </div>
-                              </div>
-                              {isSelected && (
-                                <span className="badge badge-primary">Selected</span>
-                              )}
+                            <div className="w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center">
+                              <svg className="w-5 h-5 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                              </svg>
                             </div>
+                            <div className="flex-1">
+                              <p className="font-medium text-gray-800">{peer.deviceName}</p>
+                              <p className="text-xs text-gray-500">
+                                {isReady ? 'Ready' : 'Connecting...'}
+                              </p>
+                            </div>
+                            <div className={`status-dot ${isReady ? '' : 'offline'}`} />
                           </div>
                         );
                       })}
@@ -681,225 +540,184 @@ const BrowserTransfer = () => {
                   )}
                 </div>
 
-                {/* File Transfer Section */}
-                <div className="card">
-                  <h2 className="text-lg font-semibold text-[var(--color-text-primary)] mb-4">
-                    Send File
-                  </h2>
+                {/* File Drop Zone */}
+                <div className="glass-card p-6">
+                  <h2 className="heading-section mb-4">Send file</h2>
 
-                  {/* File Input */}
-                  <div className="mb-4">
-                    <input
-                      type="file"
-                      ref={fileInputRef}
-                      onChange={handleFileSelect}
-                      className="hidden"
-                    />
-                    <button
-                      onClick={() => fileInputRef.current?.click()}
-                      className="w-full p-6 border-2 border-dashed border-[var(--color-border)] rounded-xl hover:border-[var(--color-primary)] hover:bg-[var(--color-primary)]/5 transition-all"
-                    >
-                      {selectedFile ? (
-                        <div className="text-center">
-                          <div className="w-12 h-12 rounded-xl bg-[var(--color-primary)]/10 flex items-center justify-center mx-auto mb-3">
-                            <svg className="w-6 h-6 text-[var(--color-primary)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                            </svg>
-                          </div>
-                          <p className="font-medium text-[var(--color-text-primary)]">{selectedFile.name}</p>
-                          <p className="text-sm text-[var(--color-text-secondary)]">{formatFileSize(selectedFile.size)}</p>
-                          <p className="text-xs text-[var(--color-primary)] mt-2">Click to change</p>
-                        </div>
-                      ) : (
-                        <div className="text-center">
-                          <div className="w-12 h-12 rounded-xl bg-[var(--color-bg-tertiary)] flex items-center justify-center mx-auto mb-3">
-                            <svg className="w-6 h-6 text-[var(--color-text-tertiary)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                              <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
-                            </svg>
-                          </div>
-                          <p className="text-[var(--color-text-secondary)]">Click to select a file</p>
-                          <p className="text-xs text-[var(--color-text-tertiary)] mt-1">or drag and drop</p>
-                        </div>
-                      )}
-                    </button>
-                  </div>
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={handleFileSelect}
+                    className="hidden"
+                  />
 
-                  {/* Selected Peer Info */}
-                  {selectedPeer && (
-                    <div className="mb-4 p-3 bg-[var(--color-primary)]/5 border border-[var(--color-primary)]/20 rounded-lg">
-                      <p className="text-sm text-[var(--color-primary)]">
-                        <span className="font-medium">Sending to:</span> {selectedPeer.deviceName}
-                      </p>
-                    </div>
-                  )}
-
-                  {/* Send Button */}
-                  <button
-                    onClick={handleSendFile}
-                    disabled={!selectedFile || !selectedPeer || peers.length === 0}
-                    className="btn btn-primary w-full"
+                  <div
+                    ref={dropZoneRef}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                    onClick={() => fileInputRef.current?.click()}
+                    className={`drop-zone mb-4 ${isDragging ? 'active' : ''}`}
                   >
-                    {!selectedFile ? 'Select a File' : !selectedPeer ? 'Select a Peer' : 'Send File'}
-                  </button>
+                    {selectedFile ? (
+                      <div>
+                        <div className="w-12 h-12 mx-auto mb-3 rounded-xl bg-yellow-100 flex items-center justify-center">
+                          <svg className="w-6 h-6 text-yellow-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+                          </svg>
+                        </div>
+                        <p className="font-medium text-gray-800 truncate">{selectedFile.name}</p>
+                        <p className="text-sm text-gray-500">{formatFileSize(selectedFile.size)}</p>
+                      </div>
+                    ) : (
+                      <div>
+                        <div className="w-12 h-12 mx-auto mb-3 rounded-xl bg-gray-100 flex items-center justify-center animate-bounce-gentle">
+                          <svg className="w-6 h-6 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+                          </svg>
+                        </div>
+                        <p className="text-gray-500">Drop file here or click to browse</p>
+                      </div>
+                    )}
+                  </div>
 
                   {/* Transfer Progress */}
                   <AnimatePresence>
                     {transferProgress && (
                       <motion.div
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: -10 }}
-                        className="mt-4 p-4 bg-[var(--color-bg-secondary)] rounded-xl"
+                        initial={{ opacity: 0, height: 0 }}
+                        animate={{ opacity: 1, height: 'auto' }}
+                        exit={{ opacity: 0, height: 0 }}
+                        className="mb-4"
                       >
-                        <div className="flex items-center justify-between mb-2">
-                          <div className="flex items-center gap-2">
-                            {transferProgress.direction === 'send' ? (
-                              <svg className="w-4 h-4 text-[var(--color-primary)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
-                              </svg>
-                            ) : (
-                              <svg className="w-4 h-4 text-[var(--color-success)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                              </svg>
-                            )}
-                            <span className="text-sm font-medium text-[var(--color-text-primary)]">
-                              {transferProgress.direction === 'send' ? 'Sending' : 'Receiving'}
-                            </span>
-                          </div>
-                          <span className="text-sm font-semibold text-[var(--color-primary)]">
-                            {transferProgress.progress?.toFixed(1)}%
+                        <div className="flex justify-between text-sm mb-2">
+                          <span className="text-gray-600">
+                            {transferProgress.direction === 'send' ? 'Sending...' : 'Receiving...'}
                           </span>
+                          <span className="font-medium">{transferProgress.progress?.toFixed(0)}%</span>
                         </div>
-                        <p className="text-xs text-[var(--color-text-secondary)] mb-2 truncate">
-                          {transferProgress.fileInfo?.name}
-                        </p>
-                        <div className="progress-bar mb-2">
-                          <div
-                            className="progress-bar-fill"
-                            style={{ width: `${transferProgress.progress || 0}%` }}
+                        <div className="progress-track">
+                          <motion.div
+                            className="progress-fill"
+                            initial={{ width: 0 }}
+                            animate={{ width: `${transferProgress.progress || 0}%` }}
                           />
-                        </div>
-                        <div className="flex justify-between text-xs text-[var(--color-text-tertiary)]">
-                          <span>
-                            {formatFileSize(transferProgress.bytesSent || transferProgress.bytesReceived || 0)} / {formatFileSize(transferProgress.totalBytes)}
-                          </span>
-                          <span>
-                            {transferProgress.speed?.toFixed(2) || 0} MB/s
-                          </span>
                         </div>
                       </motion.div>
                     )}
                   </AnimatePresence>
+
+                  <button
+                    onClick={handleSendFile}
+                    disabled={!selectedFile || !selectedPeer || !!transferProgress}
+                    className="btn-golden w-full"
+                  >
+                    {!selectedFile ? 'Select a file' : !selectedPeer ? 'Select a peer' : 'Send'}
+                  </button>
                 </div>
               </div>
 
-              {/* Transfer History */}
-              {transferHistory.length > 0 && (
-                <motion.div
-                  className="card mt-6"
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: 0.2 }}
-                >
-                  <div className="flex items-center justify-between mb-4">
-                    <h2 className="text-lg font-semibold text-[var(--color-text-primary)]">
-                      Transfer History
-                    </h2>
-                    <span className="badge badge-neutral">{transferHistory.length}</span>
-                  </div>
-                  <div className="space-y-2">
-                    {transferHistory.map((transfer, index) => (
-                      <div
-                        key={index}
-                        className="p-3 bg-[var(--color-bg-secondary)] rounded-lg flex items-center justify-between"
-                      >
-                        <div className="flex items-center gap-3">
-                          <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-                            transfer.direction === 'send'
-                              ? 'bg-[var(--color-primary)]/10 text-[var(--color-primary)]'
-                              : 'bg-[var(--color-success)]/10 text-[var(--color-success)]'
-                          }`}>
-                            {transfer.direction === 'send' ? (
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
-                              </svg>
-                            ) : (
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                              </svg>
-                            )}
-                          </div>
-                          <div>
-                            <p className="font-medium text-sm text-[var(--color-text-primary)]">{transfer.filename}</p>
-                            <p className="text-xs text-[var(--color-text-tertiary)]">
-                              {transfer.direction === 'send' ? 'Sent' : 'Received'} - {formatFileSize(transfer.size)}
-                            </p>
-                          </div>
-                        </div>
-                        <span className="badge badge-success">
-                          Success
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </motion.div>
-              )}
+              {/* Leave button */}
+              <div className="text-center mt-8">
+                <button onClick={handleLeaveRoom} className="btn-ghost text-gray-500">
+                  Leave Room
+                </button>
+              </div>
             </motion.div>
           )}
-        </div>
+        </AnimatePresence>
 
-        {/* Incoming File Request Modal */}
+        {/* Incoming File Modal */}
         <AnimatePresence>
           {pendingFileRequest && (
-            <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="modal-overlay"
+            >
               <motion.div
-                className="card max-w-md w-full"
-                initial={{ scale: 0.95, opacity: 0 }}
+                initial={{ scale: 0.9, opacity: 0 }}
                 animate={{ scale: 1, opacity: 1 }}
-                exit={{ scale: 0.95, opacity: 0 }}
+                exit={{ scale: 0.9, opacity: 0 }}
+                className="modal-content"
               >
-                <div className="flex items-center gap-3 mb-4">
-                  <div className="w-10 h-10 rounded-lg bg-[var(--color-info)]/10 flex items-center justify-center">
-                    <svg className="w-5 h-5 text-[var(--color-info)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                    </svg>
-                  </div>
-                  <h3 className="text-xl font-semibold text-[var(--color-text-primary)]">Incoming File</h3>
+                <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-blue-50 flex items-center justify-center">
+                  <svg className="w-8 h-8 text-blue-500 animate-bounce-gentle" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+                  </svg>
                 </div>
-                <div className="mb-6">
-                  <p className="text-[var(--color-text-secondary)] mb-3">
-                    <span className="font-medium text-[var(--color-text-primary)]">{pendingFileRequest.fromDeviceName}</span> wants to send you a file:
-                  </p>
-                  <div className="p-4 bg-[var(--color-bg-secondary)] rounded-xl">
-                    <div className="flex items-center gap-3">
-                      <div className="w-10 h-10 rounded-lg bg-[var(--color-primary)]/10 flex items-center justify-center flex-shrink-0">
-                        <svg className="w-5 h-5 text-[var(--color-primary)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                        </svg>
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <p className="font-medium text-[var(--color-text-primary)] truncate">{pendingFileRequest.fileInfo.name}</p>
-                        <p className="text-sm text-[var(--color-text-tertiary)]">{formatFileSize(pendingFileRequest.fileInfo.size)}</p>
-                      </div>
-                    </div>
-                  </div>
+
+                <h3 className="heading-section mb-2">Incoming file</h3>
+                <p className="text-gray-500 mb-4">
+                  from <span className="font-medium text-gray-700">{pendingFileRequest.fromDeviceName}</span>
+                </p>
+
+                <div className="bg-gray-50 rounded-xl p-4 mb-6">
+                  <p className="font-medium text-gray-800 truncate">{pendingFileRequest.fileInfo.name}</p>
+                  <p className="text-sm text-gray-500">{formatFileSize(pendingFileRequest.fileInfo.size)}</p>
                 </div>
+
                 <div className="flex gap-3">
-                  <button
-                    onClick={handleRejectFile}
-                    className="btn btn-secondary flex-1"
-                  >
+                  <button onClick={handleRejectFile} className="btn-outline flex-1">
                     Decline
                   </button>
-                  <button
-                    onClick={handleAcceptFile}
-                    className="btn btn-primary flex-1"
-                  >
+                  <button onClick={handleAcceptFile} className="btn-golden flex-1">
                     Accept
                   </button>
                 </div>
               </motion.div>
-            </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Completion Modal */}
+        <AnimatePresence>
+          {showCompletionModal && completedTransfer && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="modal-overlay"
+            >
+              <motion.div
+                initial={{ scale: 0.9, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.9, opacity: 0 }}
+                className="modal-content"
+              >
+                <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-green-50 flex items-center justify-center animate-success-pulse">
+                  <svg className="w-8 h-8 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                  </svg>
+                </div>
+
+                <h3 className="heading-section mb-2">
+                  {completedTransfer.direction === 'send' ? 'File sent!' : 'File received!'}
+                </h3>
+                <p className="text-gray-500 mb-6">
+                  {completedTransfer.fileInfo.name}
+                </p>
+
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => {
+                      setShowCompletionModal(false);
+                      handleLeaveRoom();
+                    }}
+                    className="btn-outline flex-1"
+                  >
+                    Exit
+                  </button>
+                  <button
+                    onClick={() => setShowCompletionModal(false)}
+                    className="btn-golden flex-1"
+                  >
+                    Stay in room
+                  </button>
+                </div>
+              </motion.div>
+            </motion.div>
           )}
         </AnimatePresence>
       </div>
