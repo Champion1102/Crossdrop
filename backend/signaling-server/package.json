@@ -1,0 +1,25 @@
+{
+  "name": "crossdrop-signaling-server",
+  "version": "1.0.0",
+  "description": "WebRTC signaling server for Crossdrop file sharing",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "NODE_ENV=development LOG_LEVEL=debug node src/index.js",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "keywords": [
+    "webrtc",
+    "signaling",
+    "websocket",
+    "file-sharing"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.14.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
