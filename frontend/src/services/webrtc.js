@@ -5,27 +5,32 @@
 
 import config from '../config';
 
-// Configuration for WebRTC
-// Include both STUN and free TURN servers for better connectivity
 const ICE_SERVERS = [
-  // Google STUN servers (fast, reliable)
+  // STUN servers (Google + Metered for redundancy)
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  // OpenRelay free TURN servers (for NAT traversal when STUN fails)
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun.relay.metered.ca:80' },
+  // TURN servers (Metered.ca free tier — needed for NAT traversal)
   {
-    urls: 'turn:openrelay.metered.ca:80',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
+    urls: 'turn:global.relay.metered.ca:80',
+    username: 'e751bb4a501fde77b9d36990',
+    credential: '138za+8ljDNb0LDk',
   },
   {
-    urls: 'turn:openrelay.metered.ca:443',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
+    urls: 'turn:global.relay.metered.ca:80?transport=tcp',
+    username: 'e751bb4a501fde77b9d36990',
+    credential: '138za+8ljDNb0LDk',
   },
   {
-    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
+    urls: 'turn:global.relay.metered.ca:443',
+    username: 'e751bb4a501fde77b9d36990',
+    credential: '138za+8ljDNb0LDk',
+  },
+  {
+    urls: 'turns:global.relay.metered.ca:443?transport=tcp',
+    username: 'e751bb4a501fde77b9d36990',
+    credential: '138za+8ljDNb0LDk',
   },
 ];
 
@@ -46,7 +51,7 @@ const RECONNECT_CONFIG = {
 // Ping/Pong configuration
 const PING_INTERVAL = 20000;      // Send ping every 20 seconds
 const PONG_TIMEOUT = 10000;       // Consider connection dead if no pong in 10s
-const CONNECTION_TIMEOUT = 15000; // Initial connection timeout
+const CONNECTION_TIMEOUT = 30000; // Initial connection timeout (30s for Render cold starts)
 
 class WebRTCService {
   constructor() {
@@ -425,21 +430,35 @@ class WebRTCService {
     this.isReconnecting = false;
 
     try {
-      // Step 1: Join room via HTTP to get peerId
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), CONNECTION_TIMEOUT);
+      // Step 1: Join room via HTTP to get peerId (with retry for cold starts)
+      let response;
+      let lastError;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), CONNECTION_TIMEOUT);
 
-      const response = await fetch(`${httpUrl}/join`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId, deviceName: this.deviceName }),
-        signal: controller.signal
-      });
+          response = await fetch(`${httpUrl}/join`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ roomId, deviceName: this.deviceName }),
+            signal: controller.signal
+          });
 
-      clearTimeout(timeoutId);
+          clearTimeout(timeoutId);
 
-      if (!response.ok) {
-        throw new Error(`Failed to join room: ${response.status}`);
+          if (response.ok) break;
+          lastError = new Error(`Failed to join room: ${response.status}`);
+        } catch (err) {
+          lastError = err.name === 'AbortError'
+            ? new Error('Server is starting up, retrying...')
+            : err;
+        }
+        if (attempt < 2) await new Promise(r => setTimeout(r, 3000 * (attempt + 1)));
+      }
+
+      if (!response?.ok) {
+        throw lastError || new Error('Failed to connect to signaling server');
       }
 
       const data = await response.json();

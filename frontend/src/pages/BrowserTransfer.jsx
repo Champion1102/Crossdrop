@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import toast from 'react-hot-toast';
 import webrtcService from '../services/webrtc';
-import { generateRoomId, checkHealth } from '../api/signaling';
+import { generateRoomId, checkHealth, wakeUpServer } from '../api/signaling';
 
 const BrowserTransfer = () => {
   // Connection state
@@ -18,6 +18,7 @@ const BrowserTransfer = () => {
   const [peerId, setPeerId] = useState(null);
   const [peers, setPeers] = useState([]);
   const [signalingAvailable, setSignalingAvailable] = useState(null);
+  const [serverWakingUp, setServerWakingUp] = useState(false);
 
   // File transfer state
   const [selectedFile, setSelectedFile] = useState(null);
@@ -31,20 +32,24 @@ const BrowserTransfer = () => {
 
   const fileInputRef = useRef(null);
 
-  // Check if signaling server is available
+  // Wake up server on mount and check health with retry
   useEffect(() => {
+    wakeUpServer();
+
     const checkSignaling = async () => {
       try {
+        setServerWakingUp(signalingAvailable === null || signalingAvailable === false);
         await checkHealth();
         setSignalingAvailable(true);
+        setServerWakingUp(false);
       } catch (error) {
         console.error('Signaling server not available:', error);
         setSignalingAvailable(false);
+        setServerWakingUp(false);
       }
     };
     checkSignaling();
 
-    // Re-check periodically
     const interval = setInterval(checkSignaling, 30000);
     return () => clearInterval(interval);
   }, []);
@@ -259,6 +264,7 @@ const BrowserTransfer = () => {
       await webrtcService.connect(newRoomId, deviceName);
     } catch (error) {
       console.error('Failed to create room:', error);
+      toast.error(error.message || 'Failed to create room. Server may be waking up — try again.');
       setIsConnecting(false);
     }
   };
@@ -276,6 +282,7 @@ const BrowserTransfer = () => {
       await webrtcService.connect(inputRoomId.toUpperCase(), deviceName);
     } catch (error) {
       console.error('Failed to join room:', error);
+      toast.error(error.message || 'Failed to join room. Server may be waking up — try again.');
       setIsConnecting(false);
     }
   };
@@ -370,25 +377,65 @@ const BrowserTransfer = () => {
 
         {/* Signaling Server Status */}
         <AnimatePresence>
-          {signalingAvailable === false && (
+          {serverWakingUp && signalingAvailable !== true && (
+            <motion.div
+              className="card mb-6 border-[var(--color-warning)] bg-[var(--color-warning)]/5"
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+            >
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-lg bg-[var(--color-warning)]/20 flex items-center justify-center flex-shrink-0">
+                  <svg className="w-5 h-5 text-[var(--color-warning)] animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                  </svg>
+                </div>
+                <div>
+                  <p className="font-medium text-[var(--color-warning)]">Waking up server...</p>
+                  <p className="text-sm text-[var(--color-text-secondary)]">
+                    The server is starting up. This may take 20-30 seconds on first visit.
+                  </p>
+                </div>
+              </div>
+            </motion.div>
+          )}
+          {signalingAvailable === false && !serverWakingUp && (
             <motion.div
               className="card mb-6 border-[var(--color-error)] bg-[var(--color-error-light)]"
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
             >
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-lg bg-[var(--color-error)]/20 flex items-center justify-center flex-shrink-0">
-                  <svg className="w-5 h-5 text-[var(--color-error)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                  </svg>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-lg bg-[var(--color-error)]/20 flex items-center justify-center flex-shrink-0">
+                    <svg className="w-5 h-5 text-[var(--color-error)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                  </div>
+                  <div>
+                    <p className="font-medium text-[var(--color-error)]">Signaling server unavailable</p>
+                    <p className="text-sm text-[var(--color-text-secondary)]">
+                      Server may be sleeping. Click retry to wake it up.
+                    </p>
+                  </div>
                 </div>
-                <div>
-                  <p className="font-medium text-[var(--color-error)]">Signaling server unavailable</p>
-                  <p className="text-sm text-[var(--color-text-secondary)]">
-                    Make sure the signaling server is running on port 3001
-                  </p>
-                </div>
+                <button
+                  onClick={async () => {
+                    setServerWakingUp(true);
+                    try {
+                      await checkHealth();
+                      setSignalingAvailable(true);
+                    } catch {
+                      setSignalingAvailable(false);
+                    }
+                    setServerWakingUp(false);
+                  }}
+                  className="btn btn-secondary text-sm px-4 py-2 flex-shrink-0"
+                >
+                  Retry
+                </button>
               </div>
             </motion.div>
           )}

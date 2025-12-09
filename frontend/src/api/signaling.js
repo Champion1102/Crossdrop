@@ -7,21 +7,18 @@ import config from '../config';
 
 // Get signaling server URLs
 const getSignalingUrls = () => {
-  // Use VITE_SIGNALING_URL if set, otherwise fallback based on environment
   if (import.meta.env.VITE_SIGNALING_URL) {
     const baseUrl = import.meta.env.VITE_SIGNALING_URL;
     const wsUrl = baseUrl.replace('http://', 'ws://').replace('https://', 'wss://');
     return { httpUrl: baseUrl, wsUrl };
   }
 
-  // Development: Use same hostname with signaling port
   if (import.meta.env.DEV) {
     const httpUrl = `http://${window.location.hostname}:3001`;
     const wsUrl = `ws://${window.location.hostname}:3001`;
     return { httpUrl, wsUrl };
   }
 
-  // Production: Assume signaling is on same domain or use default
   const protocol = window.location.protocol;
   const wsProtocol = protocol === 'https:' ? 'wss:' : 'ws:';
   const httpUrl = `${protocol}//${window.location.host}/signaling`;
@@ -31,79 +28,99 @@ const getSignalingUrls = () => {
 
 const { httpUrl: SIGNALING_SERVER_URL, wsUrl: WS_SIGNALING_URL } = getSignalingUrls();
 
+const FETCH_TIMEOUT = 30000; // 30s to handle Render cold starts
+
+/**
+ * Fetch with retry and timeout — handles Render free tier cold starts
+ */
+const fetchWithRetry = async (url, options = {}, retries = 3, backoff = 3000) => {
+  let lastError;
+
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        return response;
+      }
+
+      // Retry on 5xx (server errors / cold start issues)
+      if (response.status >= 500 && attempt < retries - 1) {
+        lastError = new Error(`HTTP ${response.status}`);
+        await new Promise(r => setTimeout(r, backoff * (attempt + 1)));
+        continue;
+      }
+
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    } catch (error) {
+      lastError = error;
+
+      if (error.name === 'AbortError') {
+        lastError = new Error('Request timed out — server may be starting up');
+      }
+
+      if (attempt < retries - 1) {
+        await new Promise(r => setTimeout(r, backoff * (attempt + 1)));
+        continue;
+      }
+    }
+  }
+
+  throw lastError;
+};
+
+/**
+ * Wake up the signaling server (fire-and-forget)
+ * Call this early on page load to minimize cold start delays
+ */
+export const wakeUpServer = () => {
+  fetch(`${SIGNALING_SERVER_URL}/health`).catch(() => {});
+};
+
 /**
  * Join a room via HTTP
- * @param {string} roomId - The room ID to join
- * @param {string} deviceName - Device name to display
- * @returns {Promise<{status, peerId, roomId, existingPeers}>}
  */
 export const joinRoom = async (roomId, deviceName = 'Browser Device') => {
-  try {
-    const response = await fetch(`${SIGNALING_SERVER_URL}/join`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ roomId, deviceName }),
-    });
+  const response = await fetchWithRetry(`${SIGNALING_SERVER_URL}/join`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ roomId, deviceName }),
+  });
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: Failed to join room`);
-    }
-
-    return await response.json();
-  } catch (error) {
-    console.error('Error joining room:', error);
-    throw error;
-  }
+  return await response.json();
 };
 
 /**
  * Get list of active rooms
- * @returns {Promise<{rooms: Array}>}
  */
 export const getRooms = async () => {
-  try {
-    const response = await fetch(`${SIGNALING_SERVER_URL}/rooms`);
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: Failed to get rooms`);
-    }
-
-    return await response.json();
-  } catch (error) {
-    console.error('Error getting rooms:', error);
-    throw error;
-  }
+  const response = await fetchWithRetry(`${SIGNALING_SERVER_URL}/rooms`);
+  return await response.json();
 };
 
 /**
- * Check signaling server health
- * @returns {Promise<{status, connections, rooms}>}
+ * Check signaling server health (with retry for cold starts)
  */
 export const checkHealth = async () => {
-  try {
-    const response = await fetch(`${SIGNALING_SERVER_URL}/health`);
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: Signaling server unhealthy`);
-    }
-
-    return await response.json();
-  } catch (error) {
-    console.error('Error checking health:', error);
-    throw error;
-  }
+  const response = await fetchWithRetry(
+    `${SIGNALING_SERVER_URL}/health`,
+    {},
+    3,   // 3 retries
+    5000  // 5s between retries (gives server time to wake)
+  );
+  return await response.json();
 };
 
 /**
  * Create a WebSocket connection to the signaling server
- * @param {Object} options - Connection options
- * @param {Function} options.onOpen - Called when connection opens
- * @param {Function} options.onMessage - Called with parsed message data
- * @param {Function} options.onClose - Called when connection closes
- * @param {Function} options.onError - Called on error
- * @returns {WebSocket} The WebSocket connection
  */
 export const createWebSocketConnection = ({
   onOpen = () => {},
@@ -142,8 +159,6 @@ export const createWebSocketConnection = ({
 
 /**
  * Send a message through the WebSocket
- * @param {WebSocket} ws - The WebSocket connection
- * @param {Object} message - Message to send (will be JSON stringified)
  */
 export const sendMessage = (ws, message) => {
   if (ws.readyState === WebSocket.OPEN) {
@@ -155,10 +170,8 @@ export const sendMessage = (ws, message) => {
 
 /**
  * Generate a unique room ID
- * @returns {string} A random room ID
  */
 export const generateRoomId = () => {
-  // Generate a 6-character alphanumeric room ID
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let result = '';
   for (let i = 0; i < 6; i++) {
@@ -167,5 +180,4 @@ export const generateRoomId = () => {
   return result;
 };
 
-// Export URLs for debugging
 export const getUrls = () => ({ SIGNALING_SERVER_URL, WS_SIGNALING_URL });

@@ -47,10 +47,10 @@ const config = {
   VERSION: '1.0.0',
 };
 
-// Log config in development
 if (config.ENABLE_DEBUG) {
   console.log('CrossDrop Config:', {
     API_BASE_URL: config.API_BASE_URL,
+    SIGNALING_URL: config.SIGNALING_URL,
     MODE: import.meta.env.MODE,
   });
 }
